@@ -1,9 +1,10 @@
-"""LINE秘書Bot - Webhookサーバー（Supabase版）"""
+"""LINE秘書Bot - Webhookサーバー（Notion版）"""
 
 import os
 import json
 import datetime
 import anthropic
+import requests as http_requests
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -16,7 +17,6 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from dotenv import load_dotenv
-from supabase import create_client
 
 load_dotenv()
 
@@ -29,24 +29,118 @@ configuration = Configuration(access_token=os.environ["LINE_CHANNEL_ACCESS_TOKEN
 # Claude設定
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-# Supabase設定
-supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+# Notion設定
+NOTION_API_KEY = os.environ["NOTION_API_KEY"]
+NOTION_TASKS_DB = os.environ["NOTION_TASKS_DB"]
+NOTION_SCHEDULE_DB = os.environ["NOTION_SCHEDULE_DB"]
+NOTION_HEADERS = {
+    "Authorization": f"Bearer {NOTION_API_KEY}",
+    "Notion-Version": "2022-06-28",
+    "Content-Type": "application/json",
+}
 
 
 def get_today():
     return datetime.date.today().isoformat()
 
 
+def notion_query(database_id, filter_obj=None):
+    """Notionデータベースを検索"""
+    url = f"https://api.notion.com/v1/databases/{database_id}/query"
+    body = {}
+    if filter_obj:
+        body["filter"] = filter_obj
+    resp = http_requests.post(url, headers=NOTION_HEADERS, json=body)
+    return resp.json().get("results", [])
+
+
 def get_tasks():
-    """Supabaseからタスク一覧を取得"""
-    result = supabase.table("tasks").select("*").neq("status", "done").order("id").execute()
-    return result.data
+    """Notionから未完了タスク一覧を取得"""
+    results = notion_query(NOTION_TASKS_DB, {
+        "property": "ステータス",
+        "select": {"does_not_equal": "done"}
+    })
+    tasks = []
+    for r in results:
+        props = r["properties"]
+        title_parts = props.get("タイトル", {}).get("title", [])
+        tasks.append({
+            "id": r["id"],
+            "title": title_parts[0]["plain_text"] if title_parts else "",
+            "category": (props.get("カテゴリ", {}).get("select") or {}).get("name", ""),
+            "priority": (props.get("優先度", {}).get("select") or {}).get("name", ""),
+            "due_date": (props.get("期限", {}).get("date") or {}).get("start", ""),
+            "status": (props.get("ステータス", {}).get("select") or {}).get("name", ""),
+            "memo": "".join([t["plain_text"] for t in props.get("メモ", {}).get("rich_text", [])]),
+        })
+    return tasks
 
 
 def get_schedule():
-    """Supabaseから予定一覧を取得"""
-    result = supabase.table("schedule").select("*").gte("date", get_today()).order("date").execute()
-    return result.data
+    """Notionから今後の予定を取得"""
+    results = notion_query(NOTION_SCHEDULE_DB, {
+        "property": "日付",
+        "date": {"on_or_after": get_today()}
+    })
+    events = []
+    for r in results:
+        props = r["properties"]
+        title_parts = props.get("タイトル", {}).get("title", [])
+        events.append({
+            "id": r["id"],
+            "title": title_parts[0]["plain_text"] if title_parts else "",
+            "date": (props.get("日付", {}).get("date") or {}).get("start", ""),
+            "time": "".join([t["plain_text"] for t in props.get("時間", {}).get("rich_text", [])]),
+            "category": (props.get("カテゴリ", {}).get("select") or {}).get("name", ""),
+            "memo": "".join([t["plain_text"] for t in props.get("メモ", {}).get("rich_text", [])]),
+        })
+    return events
+
+
+def add_task(data):
+    """Notionにタスクを追加"""
+    url = "https://api.notion.com/v1/pages"
+    properties = {
+        "タイトル": {"title": [{"text": {"content": data["title"]}}]},
+        "カテゴリ": {"select": {"name": data.get("category", "personal")}},
+        "優先度": {"select": {"name": data.get("priority", "medium")}},
+        "ステータス": {"select": {"name": "todo"}},
+    }
+    if data.get("due_date"):
+        properties["期限"] = {"date": {"start": data["due_date"]}}
+    if data.get("notes"):
+        properties["メモ"] = {"rich_text": [{"text": {"content": data["notes"]}}]}
+    body = {"parent": {"database_id": NOTION_TASKS_DB}, "properties": properties}
+    http_requests.post(url, headers=NOTION_HEADERS, json=body)
+
+
+def add_event(data):
+    """Notionに予定を追加"""
+    url = "https://api.notion.com/v1/pages"
+    properties = {
+        "タイトル": {"title": [{"text": {"content": data["title"]}}]},
+        "日付": {"date": {"start": data["date"]}},
+        "カテゴリ": {"select": {"name": data.get("category", "personal")}},
+    }
+    if data.get("time"):
+        properties["時間"] = {"rich_text": [{"text": {"content": data["time"]}}]}
+    if data.get("notes"):
+        properties["メモ"] = {"rich_text": [{"text": {"content": data["notes"]}}]}
+    body = {"parent": {"database_id": NOTION_SCHEDULE_DB}, "properties": properties}
+    http_requests.post(url, headers=NOTION_HEADERS, json=body)
+
+
+def update_task_status(page_id, status):
+    """タスクのステータスを更新"""
+    url = f"https://api.notion.com/v1/pages/{page_id}"
+    properties = {"ステータス": {"select": {"name": status}}}
+    http_requests.patch(url, headers=NOTION_HEADERS, json={"properties": properties})
+
+
+def delete_notion_page(page_id):
+    """Notionページをアーカイブ（削除）"""
+    url = f"https://api.notion.com/v1/pages/{page_id}"
+    http_requests.patch(url, headers=NOTION_HEADERS, json={"archived": True})
 
 
 def build_system_prompt():
@@ -95,22 +189,22 @@ def build_system_prompt():
 
 **add_event:**
 ```json
-{{"title": "イベント名", "date": "YYYY-MM-DD", "time": "HH:MM or null", "category": "business|kids|personal", "recurring": "none|daily|weekly|monthly|yearly", "notes": ""}}
+{{"title": "イベント名", "date": "YYYY-MM-DD", "time": "HH:MM or null", "category": "business|kids|personal", "notes": ""}}
 ```
 
 **complete_task:**
 ```json
-{{"task_id": 1}}
+{{"task_id": "NotionページID"}}
 ```
 
 **delete_task:**
 ```json
-{{"task_id": 1}}
+{{"task_id": "NotionページID"}}
 ```
 
 **delete_event:**
 ```json
-{{"event_id": 1}}
+{{"event_id": "NotionページID"}}
 ```
 
 **none (確認・一覧表示時):**
@@ -121,6 +215,7 @@ def build_system_prompt():
 ## 注意
 - 相対日付（「来週月曜」「明後日」等）は今日 {today} を基準に絶対日付に変換
 - category は文脈から推測（占い事業→business、子供→kids、その他→personal）
+- タスク完了・削除時は、タスク一覧のidフィールドの値をtask_idに使用すること
 - 返信は簡潔で親しみやすく
 """
 
@@ -148,41 +243,18 @@ def process_message(user_message):
     result = json.loads(raw.strip())
     action = result.get("action", "none")
     data = result.get("data", {})
-    today = get_today()
 
     # アクション実行
     if action == "add_task":
-        supabase.table("tasks").insert({
-            "title": data["title"],
-            "category": data.get("category", "personal"),
-            "priority": data.get("priority", "medium"),
-            "due_date": data.get("due_date"),
-            "status": "todo",
-            "notes": data.get("notes", ""),
-            "created_at": today,
-        }).execute()
-
+        add_task(data)
     elif action == "add_event":
-        supabase.table("schedule").insert({
-            "title": data["title"],
-            "date": data["date"],
-            "time": data.get("time"),
-            "category": data.get("category", "personal"),
-            "recurring": data.get("recurring", "none"),
-            "notes": data.get("notes", ""),
-        }).execute()
-
+        add_event(data)
     elif action == "complete_task":
-        supabase.table("tasks").update({
-            "status": "done",
-            "completed_at": today,
-        }).eq("id", data.get("task_id")).execute()
-
+        update_task_status(data.get("task_id"), "done")
     elif action == "delete_task":
-        supabase.table("tasks").delete().eq("id", data.get("task_id")).execute()
-
+        delete_notion_page(data.get("task_id"))
     elif action == "delete_event":
-        supabase.table("schedule").delete().eq("id", data.get("event_id")).execute()
+        delete_notion_page(data.get("event_id"))
 
     return result["reply"]
 
